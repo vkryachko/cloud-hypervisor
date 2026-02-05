@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::ops::{BitAnd, Not, Sub};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::os::fd::AsFd;
@@ -2563,6 +2563,84 @@ impl Snapshottable for MemoryManager {
     }
 }
 
+/// A `WriteVolatile` wrapper that creates sparse files by skipping writes of zero-filled data.
+///
+/// When data written is all zeros, this wrapper advances its logical position without
+/// actually writing to the underlying file, creating "holes" that don't consume disk space.
+/// Non-zero data is written normally after seeking to the correct position.
+///
+/// # Safety
+/// This is safe to use with `write_volatile_to` because the data is copied from guest
+/// memory into a temporary host buffer for zero-checking before deciding to write.
+/// However, the caller must ensure the VM is paused during snapshot operations to
+/// guarantee memory consistency.
+struct SparseWriter<W> {
+    inner: W,
+    /// Current logical position in the file
+    pos: u64,
+    /// Last position where we actually wrote data (for seek optimization)
+    last_written_pos: u64,
+    /// Reusable buffer for zero-checking (avoids repeated allocations)
+    buffer: Vec<u8>,
+}
+
+/// Maximum chunk size for zero-checking. Using 64KiB as it's:
+/// - A multiple of page size (4096) for filesystem alignment
+/// - Large enough to reduce syscall overhead
+/// - Small enough to bound memory usage regardless of how much data vm-memory passes
+const SPARSE_CHUNK_SIZE: usize = 65536;
+
+impl<W: Write + Seek> SparseWriter<W> {
+    fn new(inner: W) -> Self {
+        SparseWriter {
+            inner,
+            pos: 0,
+            last_written_pos: 0,
+            buffer: vec![0u8; SPARSE_CHUNK_SIZE],
+        }
+    }
+}
+
+impl<W: Write + Seek> vm_memory::WriteVolatile for SparseWriter<W> {
+    fn write_volatile<B: vm_memory::bitmap::BitmapSlice>(
+        &mut self,
+        buf: &vm_memory::VolatileSlice<B>,
+    ) -> Result<usize, vm_memory::VolatileMemoryError> {
+        let total_len = buf.len();
+        if total_len == 0 {
+            return Ok(0);
+        }
+
+        let mut offset = 0;
+        while offset < total_len {
+            let chunk_len = std::cmp::min(SPARSE_CHUNK_SIZE, total_len - offset);
+            let chunk_slice = buf.subslice(offset, chunk_len)
+                .map_err(|e| vm_memory::VolatileMemoryError::IOError(
+                    io::Error::new(io::ErrorKind::Other, e)
+                ))?;
+
+            chunk_slice.copy_to(&mut self.buffer[..chunk_len]);
+
+            if self.buffer[..chunk_len].iter().all(|&b| b == 0) {
+                self.pos += chunk_len as u64;
+            } else {
+                if self.pos != self.last_written_pos {
+                    self.inner.seek(SeekFrom::Start(self.pos))
+                        .map_err(vm_memory::VolatileMemoryError::IOError)?;
+                }
+                self.inner.write_all(&self.buffer[..chunk_len])
+                    .map_err(vm_memory::VolatileMemoryError::IOError)?;
+                self.pos += chunk_len as u64;
+                self.last_written_pos = self.pos;
+            }
+
+            offset += chunk_len;
+        }
+
+        Ok(total_len)
+    }
+}
+
 impl Transportable for MemoryManager {
     fn send(
         &self,
@@ -2577,13 +2655,23 @@ impl Transportable for MemoryManager {
         memory_file_path.push(String::from(SNAPSHOT_FILENAME));
 
         // Create the snapshot file for the entire memory
-        let mut memory_file = OpenOptions::new()
+        let memory_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(memory_file_path)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
+        let mut total_length: u64 = 0;
+        for range in self.snapshot_memory_ranges.regions() {
+            total_length += range.length;
+        }
+
+        memory_file
+            .set_len(total_length)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        let mut sparse_file = SparseWriter::new(memory_file);
         let guest_memory = self.guest_memory.memory();
 
         for range in self.snapshot_memory_ranges.regions() {
@@ -2597,7 +2685,7 @@ impl Transportable for MemoryManager {
                 let bytes_written = guest_memory
                     .write_volatile_to(
                         GuestAddress(range.gpa + offset),
-                        &mut memory_file,
+                        &mut sparse_file,
                         (range.length - offset) as usize,
                     )
                     .map_err(|e| MigratableError::MigrateSend(e.into()))?;
